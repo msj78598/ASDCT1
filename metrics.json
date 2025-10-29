@@ -1,0 +1,15 @@
+{
+  "timestamp": "2025-10-28 21:09:59",
+  "training_rows": 395637,
+  "features": [
+    "V1",
+    "V2",
+    "V3",
+    "A1",
+    "A2",
+    "A3"
+  ],
+  "target_anomaly_rate": 0.05,
+  "threshold_ensemble": 0.6817185611251276,
+  "model_agreement_rate": 0.1056043797723671
+}
