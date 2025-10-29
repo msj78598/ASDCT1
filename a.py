@@ -157,7 +157,7 @@ def label_confirmed_and_suspected(
 
 # ===================== واجهة Streamlit =====================
 st.set_page_config(page_title="ASDCT • IF + OCSVM + Rules", layout="wide")
-st.title("كشف حالات الفاقد في عدادات CT — (Isolation Forest + One-Class SVM) + قواعد تأكيد/اشتباه")
+st.title("نظام اكتشاف حالات الفاقد المحتملة عدادات CT")
 
 with st.sidebar:
     st.header("إعدادات النموذج")
