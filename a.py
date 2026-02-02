@@ -1,27 +1,26 @@
 # -*- coding: utf-8 -*-
 """
 Agricultural Load-Based Loss Detection System (Streamlit)
+تحليل أحمال/سلوك كهربائي لعدادات يُفترض أنها مرتبطة بحقول زراعية فعّالة.
 
-Purpose:
-Analyze voltage/current readings for meters assumed to be connected to active agricultural fields.
-Any illogical electrical behavior is treated as a potential non-technical loss indicator.
-
-Classification:
+منهجية التصنيف (بدون علاقة بالبريكر):
 1) Confirmed Loss:
-   - Current present with near-zero voltage on the same phase
-   - Zero/near-zero current on one phase while other phases carry significant load
-   - Severe current imbalance between phases (i_imb high)
+   - وجود جهد قريب من الصفر على أي فازة (V≈0) مع وجود جهد معتبر في فازة أخرى (حتى لو بدون تيار).
+   - وجود تيار مع جهد قريب من الصفر على نفس الفازة.
+   - فازة تيارها ≈0 بينما فازات أخرى عليها حمل واضح.
+   - عدم اتزان تيار شديد بين الفازات (i_imb).
 
 2) Suspected High Loss:
-   - Zero load while voltage is present (field assumed active, but may be fed by another meter)
+   - جهد موجود + حمل/تيار = صفر (No-Load)
+   - (اختياري) consumption = 0 إذا كان موجودًا بالملف (كمؤشر داعم)
 
 3) Suspected Medium Loss:
-   - Very low load while voltage is present (seasonal/limited operation possible)
+   - جهد موجود + حمل منخفض جدًا (Very Low Load)
 
 4) Normal:
-   - No abnormal electrical behavior detected
+   - لا توجد مؤشرات غير منطقية ضمن الحدود.
 
-Run:
+تشغيل:
   pip install -r requirements.txt
   streamlit run app.py
 """
@@ -44,8 +43,8 @@ PATH_SVM    = PROJECT_DIR / "ocsvm.joblib"  # optional
 ID_COL = "Meter Number"
 FEATURE_COLS = ["V1", "V2", "V3", "A1", "A2", "A3"]
 
-# Optional consumption column (if present, used as a supporting indicator only)
-POSSIBLE_CONS_COLS = ["consumption", "Consumption", "kwh", "KWH", "kWh", "Energy", "energy"]
+# Optional consumption column (support only)
+POSSIBLE_CONS_COLS = ["consumption", "Consumption", "consumption_value", "kwh", "KWH", "kWh", "Energy", "energy"]
 
 # ===================== Helpers =====================
 def validate_columns(df: pd.DataFrame, required_cols):
@@ -80,9 +79,6 @@ def make_template_excel() -> bytes:
     tmp = pd.DataFrame(columns=[ID_COL] + FEATURE_COLS)
     return excel_bytes(tmp)
 
-def clip01(x):
-    return np.clip(x, 0, 1)
-
 def find_consumption_col(df: pd.DataFrame):
     for c in POSSIBLE_CONS_COLS:
         if c in df.columns:
@@ -91,34 +87,26 @@ def find_consumption_col(df: pd.DataFrame):
 
 # ===================== Load models (optional) =====================
 @lru_cache(maxsize=1)
-def load_models_if_available():
-    """
-    Optional: Load scaler + IF + (optional) SVM if present.
-    If not present, return None and system still works using rules-only classification.
-    """
-    if not PATH_SCALER.exists() or not PATH_IF.exists():
-        return None
-
+def load_models():
     models = {}
-    models["scaler"] = joblib.load(PATH_SCALER)
-    models["if"] = joblib.load(PATH_IF)
-
-    if PATH_SVM.exists():
-        try:
-            models["svm"] = joblib.load(PATH_SVM)
-        except Exception:
+    if PATH_SCALER.exists() and PATH_IF.exists():
+        models["scaler"] = joblib.load(PATH_SCALER)
+        models["if"] = joblib.load(PATH_IF)
+        if PATH_SVM.exists():
+            try:
+                models["svm"] = joblib.load(PATH_SVM)
+            except Exception:
+                models["svm"] = None
+        else:
             models["svm"] = None
     else:
+        models["scaler"] = None
+        models["if"] = None
         models["svm"] = None
-
     return models
 
 def model_decision_flags(Xs, model_if, model_svm=None, thr_if=0.0, thr_svm=0.0, use_or=True):
-    """
-    Optional only.
-    decision_function >= 0 غالبًا طبيعي
-    decision_function < 0 غالبًا شاذ
-    """
+    """اختياري: model_flag للمراجعة فقط."""
     df_if = model_if.decision_function(Xs)
     anom_if = (df_if < thr_if).astype(int)
 
@@ -127,49 +115,28 @@ def model_decision_flags(Xs, model_if, model_svm=None, thr_if=0.0, thr_svm=0.0, 
     if model_svm is not None:
         df_svm = model_svm.decision_function(Xs)
         anom_svm = (df_svm < thr_svm).astype(int)
-        if use_or:
-            flags = ((anom_if == 1) | (anom_svm == 1)).astype(int)
-        else:
-            flags = ((anom_if == 1) & (anom_svm == 1)).astype(int)
-    else:
-        flags = anom_if
-
-    if df_svm is not None:
+        flags = ((anom_if == 1) | (anom_svm == 1)).astype(int) if use_or else ((anom_if == 1) & (anom_svm == 1)).astype(int)
         score_ens = (-0.5 * df_if) + (-0.5 * df_svm)
     else:
+        flags = anom_if
         score_ens = -df_if
 
     return df_if, df_svm, score_ens, flags, anom_if, anom_svm
 
 # ===================== Feature engineering =====================
-def compute_signal_features(
-    df: pd.DataFrame,
-    v_eps: float = 1e-6,
-    i_eps: float = 1e-6,
-    r_eps: float = 1e-6,
-    i_near_zero_thr: float = 0.05,
-) -> pd.DataFrame:
-    """
-    Stable electrical indicators:
-    - V_mean, V_min, V_max
-    - I_sum, I_max
-    - v_imb, i_imb
-    - weak_ratio
-    - r_spread
-    - near_zero_phase_present (any phase current near zero)
-    """
-    V = df[["V1", "V2", "V3"]].astype(float)
-    A = df[["A1", "A2", "A3"]].astype(float)
-
+def compute_signal_features(df: pd.DataFrame, v_eps: float = 1e-6, i_eps: float = 1e-6, r_eps: float = 1e-6,
+                            i_near_zero_thr: float = 0.05) -> pd.DataFrame:
     out = df.copy()
+    V = out[["V1", "V2", "V3"]].astype(float)
+    A = out[["A1", "A2", "A3"]].astype(float)
 
     out["V_mean"] = V.mean(axis=1)
-    out["V_min"] = V.min(axis=1)
-    out["V_max"] = V.max(axis=1)
+    out["V_min"]  = V.min(axis=1)
+    out["V_max"]  = V.max(axis=1)
 
     out["I_mean"] = A.mean(axis=1)
-    out["I_sum"] = A.sum(axis=1)
-    out["I_max"] = A.abs().max(axis=1)
+    out["I_sum"]  = A.sum(axis=1)
+    out["I_max"]  = A.abs().max(axis=1)
 
     out["v_imb"] = (V.max(axis=1) - V.min(axis=1)) / out["V_mean"].abs().clip(lower=v_eps)
     out["i_imb"] = (A.max(axis=1) - A.min(axis=1)) / out["I_mean"].abs().clip(lower=i_eps)
@@ -186,115 +153,126 @@ def compute_signal_features(
     out["r_spread"] = (R.max(axis=1) / r_min).clip(lower=1.0)
 
     out["near_zero_phase_present"] = (A.abs().le(i_near_zero_thr).sum(axis=1) >= 1).astype(int)
-
     return out
 
-# ===================== Agricultural Load-Based Classification =====================
-def apply_agri_load_rules(
+# ===================== Rules-based classification =====================
+def apply_load_based_rules(
     df: pd.DataFrame,
-    # Voltage presence / near-zero definition
-    v_present_min: float = 50.0,        # consider "voltage present" if V_mean >= this
-    v_zero_pct: float = 0.10,           # near-zero threshold = v_zero_pct * V_mean
-    v_zero_abs_max: float = 15.0,       # OR absolute near-zero ceiling (extra safety)
+    # Voltage
+    v_zero_pct: float = 0.10,
+    v_zero_abs_max: float = 15.0,       # سقف مطلق لتحديد V≈0
+    v_present_abs: float = 50.0,        # اعتبر الجهد "موجود" إذا V_max >= هذا
+    v_other_present_abs: float = 50.0,  # لتأكيد "فازة أخرى فيها جهد"
 
-    # Current thresholds
-    i_significant: float = 2.0,         # current indicating load
-    i_near_zero_thr: float = 0.05,      # current considered (near) zero
+    # Current
+    i_near_zero_thr: float = 0.05,
+    i_phase_load_thr: float = 1.0,
+    i_sum_no_load_thr: float = 0.15,
+    i_sum_low_load_thr: float = 0.80,
 
-    # Confirmed imbalance thresholds
-    i_imb_confirm_thr: float = 1.80,    # severe i_imb
+    # Imbalance
+    i_imb_confirm_thr: float = 1.50,
 
-    # No-Load / Low-Load thresholds for agricultural list
-    no_load_sum_thr: float = 0.20,      # I_sum <= this => No-Load
-    no_load_max_thr: float = 0.10,      # I_max <= this => No-Load
-    low_load_sum_thr: float = 1.00,     # I_sum <= this (but > no_load) => Low-Load
-    low_load_max_thr: float = 0.50,     # I_max <= this (but > no_load) => Low-Load
+    # Consumption support (optional)
+    use_consumption_if_available: bool = True,
+    consumption_zero_thr: float = 0.0,
 ):
     out = df.copy()
     V = out[["V1", "V2", "V3"]].astype(float)
     A = out[["A1", "A2", "A3"]].astype(float)
 
-    # Voltage present (system assumption: field is active, so V should exist)
-    v_present = (out["V_mean"].fillna(0) >= v_present_min)
+    # Optional consumption
+    cons_col = find_consumption_col(out) if use_consumption_if_available else None
+    if cons_col is not None:
+        out[cons_col] = pd.to_numeric(out[cons_col], errors="coerce")
+        out["consumption_value"] = out[cons_col]
+    else:
+        out["consumption_value"] = np.nan
 
-    # Near-zero voltage threshold row-wise
-    v_zero_thr_row = (v_zero_pct * out["V_mean"].abs()).fillna(0.0)
-    v_zero_thr_row = np.minimum(v_zero_thr_row, v_zero_abs_max)  # cap it
+    # Voltage present?
+    voltage_present = (out["V_max"].abs().fillna(0) >= v_present_abs)
 
-    # ----- Confirmed Loss rules -----
+    # Near-zero voltage threshold per-row: min(pct * |V_mean|, abs_cap)
+    v_mean_abs = out["V_mean"].abs().fillna(0.0)
+    v_zero_thr = np.minimum(v_zero_pct * v_mean_abs, float(v_zero_abs_max))
 
-    # C1: I present with near-zero V on same phase
-    c1_v0_with_i = (
-        ((out["V1"] <= v_zero_thr_row) & (out["A1"].abs() >= i_significant)) |
-        ((out["V2"] <= v_zero_thr_row) & (out["A2"].abs() >= i_significant)) |
-        ((out["V3"] <= v_zero_thr_row) & (out["A3"].abs() >= i_significant))
-    ) & v_present
+    v1_zero = out["V1"].abs().fillna(0) <= v_zero_thr
+    v2_zero = out["V2"].abs().fillna(0) <= v_zero_thr
+    v3_zero = out["V3"].abs().fillna(0) <= v_zero_thr
 
-    # C2: one phase current ~0 while other phases carry significant load
-    near_zero_phase = (A.abs().le(i_near_zero_thr)).sum(axis=1) >= 1
-    other_has_load = (A.abs().ge(i_significant)).sum(axis=1) >= 1
-    c2_i0_one_phase_others_load = v_present & near_zero_phase & other_has_load
+    v1_other_present = (out["V2"].abs().fillna(0) >= v_other_present_abs) | (out["V3"].abs().fillna(0) >= v_other_present_abs)
+    v2_other_present = (out["V1"].abs().fillna(0) >= v_other_present_abs) | (out["V3"].abs().fillna(0) >= v_other_present_abs)
+    v3_other_present = (out["V1"].abs().fillna(0) >= v_other_present_abs) | (out["V2"].abs().fillna(0) >= v_other_present_abs)
 
-    # C3: severe current imbalance
-    c3_severe_iimb = v_present & (out["i_imb"].fillna(0) >= i_imb_confirm_thr) & (out["I_max"].fillna(0) >= i_significant)
+    # Current levels
+    no_load = (out["I_sum"].abs().fillna(0) <= i_sum_no_load_thr) & (out["I_max"].abs().fillna(0) <= max(i_sum_no_load_thr, i_near_zero_thr))
+    low_load = (~no_load) & (out["I_sum"].abs().fillna(0) <= i_sum_low_load_thr)
 
-    confirmed = (c1_v0_with_i | c2_i0_one_phase_others_load | c3_severe_iimb)
-
-    out["reason_confirm_v0_with_i"] = c1_v0_with_i.astype(int)
-    out["reason_confirm_i_near_zero"] = c2_i0_one_phase_others_load.astype(int)
-    out["reason_confirm_extreme_iimb"] = c3_severe_iimb.astype(int)
-
-    # ----- Suspected High / Medium -----
-
-    # No-Load (Suspected High): voltage present but essentially no current
-    no_load = v_present & (out["I_sum"].fillna(0) <= no_load_sum_thr) & (out["I_max"].fillna(0) <= no_load_max_thr)
-
-    # Low-Load (Suspected Medium): voltage present but very low current (above no-load)
-    low_load = (
-        v_present &
-        (~no_load) &
-        (out["I_sum"].fillna(0) <= low_load_sum_thr) &
-        (out["I_max"].fillna(0) <= low_load_max_thr)
+    # ---------------- Confirmed ----------------
+    # C0: V≈0 on any phase + another phase has voltage (even if current is zero)  ✅ key change
+    c0_v_zero_any = voltage_present & (
+        (v1_zero & v1_other_present) |
+        (v2_zero & v2_other_present) |
+        (v3_zero & v3_other_present)
     )
 
-    # If consumption column exists, add supportive reasons (does not override)
-    if "consumption_value" in out.columns:
-        # zero consumption support only if value is numeric
-        cons_zero = out["consumption_value"].fillna(0) <= 0
-    else:
-        cons_zero = pd.Series(False, index=out.index)
+    # C1: V≈0 with current on same phase
+    c1_v0_with_i = (
+        (v1_zero & (out["A1"].abs().fillna(0) >= i_phase_load_thr)) |
+        (v2_zero & (out["A2"].abs().fillna(0) >= i_phase_load_thr)) |
+        (v3_zero & (out["A3"].abs().fillna(0) >= i_phase_load_thr))
+    ) & voltage_present
 
-    # Suspected High: No-load while voltage present (strong suspicion)
-    suspected_high = (~confirmed) & no_load
-    # Suspected Medium: low-load while voltage present (medium suspicion)
-    suspected_medium = (~confirmed) & (~suspected_high) & low_load
+    # C2: one phase current ~0 while another is significantly loaded
+    c2_i_near_zero_with_load = voltage_present & (
+        ((out["A1"].abs().fillna(0) <= i_near_zero_thr) & ((out["A2"].abs().fillna(0) >= i_phase_load_thr) | (out["A3"].abs().fillna(0) >= i_phase_load_thr))) |
+        ((out["A2"].abs().fillna(0) <= i_near_zero_thr) & ((out["A1"].abs().fillna(0) >= i_phase_load_thr) | (out["A3"].abs().fillna(0) >= i_phase_load_thr))) |
+        ((out["A3"].abs().fillna(0) <= i_near_zero_thr) & ((out["A1"].abs().fillna(0) >= i_phase_load_thr) | (out["A2"].abs().fillna(0) >= i_phase_load_thr)))
+    )
 
-    out["reason_suspected_high_no_load"] = suspected_high.astype(int)
+    # C3: severe current imbalance
+    c3_extreme_iimb = voltage_present & (out["i_imb"].fillna(0) >= i_imb_confirm_thr) & (out["I_max"].fillna(0) >= i_phase_load_thr)
+
+    confirmed = c0_v_zero_any | c1_v0_with_i | c2_i_near_zero_with_load | c3_extreme_iimb
+
+    out["reason_confirm_v0_any_phase"] = c0_v_zero_any.astype(int)
+    out["reason_confirm_v0_with_i"] = c1_v0_with_i.astype(int)
+    out["reason_confirm_i_near_zero"] = c2_i_near_zero_with_load.astype(int)
+    out["reason_confirm_extreme_iimb"] = c3_extreme_iimb.astype(int)
+
+    # ---------------- Suspected High / Medium ----------------
+    cons_zero = pd.Series(False, index=out.index)
+    if cons_col is not None:
+        cons_zero = out["consumption_value"].fillna(np.inf) <= consumption_zero_thr
+
+    suspected_high = (~confirmed) & voltage_present & (no_load | cons_zero)
+    out["reason_suspected_high_no_load"] = ((~confirmed) & voltage_present & no_load).astype(int)
+    out["reason_suspected_high_no_consumption"] = ((~confirmed) & voltage_present & cons_zero).astype(int)
+
+    suspected_medium = (~confirmed) & (~suspected_high) & voltage_present & low_load
     out["reason_suspected_medium_low_load"] = suspected_medium.astype(int)
-    out["support_consumption_zero"] = cons_zero.astype(int)
 
-    # ----- Normal -----
-    normal = (~confirmed) & (~suspected_high) & (~suspected_medium)
-
-    # Final label
+    # ---------------- Final label ----------------
     out["final_label"] = np.select(
-        [confirmed, suspected_high, suspected_medium, normal],
-        ["Confirmed Loss", "Suspected High Loss", "Suspected Medium Loss", "Normal"],
+        [confirmed, suspected_high, suspected_medium],
+        ["Confirmed Loss", "Suspected High Loss", "Suspected Medium Loss"],
         default="Normal"
     )
 
-    # Primary reason (single text)
+    # Primary reason
     def primary_reason_row(r):
         if r["final_label"] == "Confirmed Loss":
-            if r["reason_confirm_v0_with_i"] == 1:
+            if r.get("reason_confirm_v0_any_phase", 0) == 1:
+                return "Voltage near-zero on a phase while another phase has voltage (illogical)"
+            if r.get("reason_confirm_v0_with_i", 0) == 1:
                 return "Current present with near-zero voltage on same phase"
-            if r["reason_confirm_i_near_zero"] == 1:
+            if r.get("reason_confirm_i_near_zero", 0) == 1:
                 return "Zero/near-zero current on one phase while other phases carry load"
-            if r["reason_confirm_extreme_iimb"] == 1:
+            if r.get("reason_confirm_extreme_iimb", 0) == 1:
                 return "Severe current imbalance between phases"
             return "Confirmed electrical contradiction"
         if r["final_label"] == "Suspected High Loss":
-            if r["support_consumption_zero"] == 1:
+            if r.get("reason_suspected_high_no_consumption", 0) == 1:
                 return "No-load with voltage present + zero consumption (support)"
             return "No-load while voltage is present"
         if r["final_label"] == "Suspected Medium Loss":
@@ -303,16 +281,9 @@ def apply_agri_load_rules(
 
     out["primary_reason"] = out.apply(primary_reason_row, axis=1)
 
-    # Severity score for sorting (higher = more priority)
-    sev = (
-        0.60 * out["reason_confirm_v0_with_i"].fillna(0) +
-        0.45 * out["reason_confirm_i_near_zero"].fillna(0) +
-        0.40 * out["reason_confirm_extreme_iimb"].fillna(0) +
-        0.30 * out["reason_suspected_high_no_load"].fillna(0) +
-        0.20 * out["reason_suspected_medium_low_load"].fillna(0) +
-        0.10 * out["support_consumption_zero"].fillna(0)
-    )
-    out["severity_score"] = sev
+    # Priority sort key
+    pr = {"Confirmed Loss": 0, "Suspected High Loss": 1, "Suspected Medium Loss": 2, "Normal": 3}
+    out["prio"] = out["final_label"].map(pr).fillna(9).astype(int)
 
     return out
 
@@ -320,190 +291,125 @@ def apply_agri_load_rules(
 st.set_page_config(page_title="Agricultural Load-Based Loss Detection", layout="wide")
 
 st.title("Agricultural Load-Based Loss Detection System")
-st.caption("تحليل كهربائي بحت (V/I) لعدادات يفترض أنها تخدم حقول زراعية نشطة — 4 مستويات تصنيف.")
+st.caption("تحليل جهد/تيار لعدادات زراعية مفترض أنها تخدم حقول فعّالة — كشف سلوك غير منطقي (بدون علاقة بالبريكر).")
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("⚙️ الإعدادات")
 
     preset = st.selectbox(
-        "Preset",
-        ["Balanced (Recommended)", "Sensitive (Catch more)", "Strict (Reduce alerts)"],
+        "Preset (جاهز)",
+        ["متوازن (Recommended)", "حساس (لا يفوّت)", "صارم (تقليل الإنذارات)"],
         index=0
     )
 
-    if preset == "Sensitive (Catch more)":
+    if preset == "حساس (لا يفوّت)":
         defaults = dict(
-            v_present_min=30.0,
-            v_zero_pct=0.12,
-            v_zero_abs_max=20.0,
-            i_significant=1.5,
-            i_near_zero_thr=0.08,
-            i_imb_confirm_thr=1.50,
-            no_load_sum_thr=0.30,
-            no_load_max_thr=0.15,
-            low_load_sum_thr=1.50,
-            low_load_max_thr=0.70,
-            use_models=False,
-            combine_or=True,
-            thr_if=0.0,
-            thr_svm=0.0,
+            v_zero_pct=0.12, v_zero_abs_max=20.0, v_present_abs=40.0, v_other_present_abs=40.0,
+            i_near_zero_thr=0.05, i_phase_load_thr=0.8, i_sum_no_load_thr=0.20, i_sum_low_load_thr=1.00,
+            i_imb_confirm_thr=1.20, use_consumption_if_available=True,
         )
-    elif preset == "Strict (Reduce alerts)":
+    elif preset == "صارم (تقليل الإنذارات)":
         defaults = dict(
-            v_present_min=60.0,
-            v_zero_pct=0.08,
-            v_zero_abs_max=12.0,
-            i_significant=2.5,
-            i_near_zero_thr=0.05,
-            i_imb_confirm_thr=2.00,
-            no_load_sum_thr=0.10,
-            no_load_max_thr=0.05,
-            low_load_sum_thr=0.80,
-            low_load_max_thr=0.40,
-            use_models=False,
-            combine_or=True,
-            thr_if=0.0,
-            thr_svm=0.0,
+            v_zero_pct=0.08, v_zero_abs_max=12.0, v_present_abs=60.0, v_other_present_abs=60.0,
+            i_near_zero_thr=0.05, i_phase_load_thr=1.5, i_sum_no_load_thr=0.12, i_sum_low_load_thr=0.60,
+            i_imb_confirm_thr=1.80, use_consumption_if_available=True,
         )
     else:
         defaults = dict(
-            v_present_min=50.0,
-            v_zero_pct=0.10,
-            v_zero_abs_max=15.0,
-            i_significant=2.0,
-            i_near_zero_thr=0.05,
-            i_imb_confirm_thr=1.80,
-            no_load_sum_thr=0.20,
-            no_load_max_thr=0.10,
-            low_load_sum_thr=1.00,
-            low_load_max_thr=0.50,
-            use_models=False,
-            combine_or=True,
-            thr_if=0.0,
-            thr_svm=0.0,
+            v_zero_pct=0.10, v_zero_abs_max=15.0, v_present_abs=50.0, v_other_present_abs=50.0,
+            i_near_zero_thr=0.05, i_phase_load_thr=1.0, i_sum_no_load_thr=0.15, i_sum_low_load_thr=0.80,
+            i_imb_confirm_thr=1.50, use_consumption_if_available=True,
         )
 
-    with st.expander("🔌 Electrical thresholds", expanded=True):
-        v_present_min = st.number_input("Voltage present if V_mean ≥", value=float(defaults["v_present_min"]), step=5.0)
-        v_zero_pct = st.slider("Near-zero voltage ratio (V ≤ pct * V_mean)", 0.02, 0.30, float(defaults["v_zero_pct"]), 0.01)
-        v_zero_abs_max = st.number_input("Near-zero voltage absolute cap (V ≤)", value=float(defaults["v_zero_abs_max"]), step=1.0)
+    with st.expander("⚡ إعدادات الجهد", expanded=True):
+        v_zero_pct = st.slider("نسبة V لتحديد V≈0 (Vphase < pct*V_mean)", 0.02, 0.30, float(defaults["v_zero_pct"]), 0.01)
+        v_zero_abs_max = st.slider("سقف مطلق لـ V≈0 (V ≤)", 1.0, 50.0, float(defaults["v_zero_abs_max"]), 1.0)
+        v_present_abs = st.slider("حد أدنى لاعتبار الجهد موجود (V_max ≥)", 10.0, 200.0, float(defaults["v_present_abs"]), 5.0)
+        v_other_present_abs = st.slider("حد أدنى لفازة أخرى لتأكيد V≈0 (V ≥)", 10.0, 200.0, float(defaults["v_other_present_abs"]), 5.0)
 
-        i_significant = st.number_input("Significant current threshold (A)", value=float(defaults["i_significant"]), step=0.5)
-        i_near_zero_thr = st.number_input("Near-zero current threshold (A)", value=float(defaults["i_near_zero_thr"]), step=0.01)
+    with st.expander("🔌 إعدادات التيار", expanded=True):
+        i_near_zero_thr = st.slider("تيار يعتبر ≈0 (A)", 0.0, 1.0, float(defaults["i_near_zero_thr"]), 0.01)
+        i_phase_load_thr = st.slider("تيار يدل على حمل واضح (A)", 0.1, 20.0, float(defaults["i_phase_load_thr"]), 0.1)
+        i_sum_no_load_thr = st.slider("حد No-Load لمجموع التيار (A)", 0.0, 5.0, float(defaults["i_sum_no_load_thr"]), 0.01)
+        i_sum_low_load_thr = st.slider("حد Very Low Load لمجموع التيار (A)", 0.1, 10.0, float(defaults["i_sum_low_load_thr"]), 0.05)
 
-        i_imb_confirm_thr = st.number_input("Severe current imbalance i_imb ≥", value=float(defaults["i_imb_confirm_thr"]), step=0.1)
+    with st.expander("📐 عدم الاتزان", expanded=True):
+        i_imb_confirm_thr = st.slider("عدم اتزان تيار شديد للتأكيد (i_imb ≥)", 0.50, 3.00, float(defaults["i_imb_confirm_thr"]), 0.05)
 
-    with st.expander("🟧 Suspected High / Medium thresholds", expanded=True):
-        no_load_sum_thr = st.number_input("No-load if I_sum ≤", value=float(defaults["no_load_sum_thr"]), step=0.05)
-        no_load_max_thr = st.number_input("No-load if I_max ≤", value=float(defaults["no_load_max_thr"]), step=0.05)
-
-        low_load_sum_thr = st.number_input("Low-load if I_sum ≤", value=float(defaults["low_load_sum_thr"]), step=0.10)
-        low_load_max_thr = st.number_input("Low-load if I_max ≤", value=float(defaults["low_load_max_thr"]), step=0.10)
-
-    with st.expander("🧠 Optional models (IF/OCSVM)", expanded=False):
-        use_models = st.toggle("Enable models (optional)", value=bool(defaults["use_models"]))
-        combine_or = st.toggle("Combine IF and OCSVM using OR", value=bool(defaults["combine_or"]))
-        thr_if = st.number_input("IF decision threshold (df < thr => anomaly)", value=float(defaults["thr_if"]), step=0.05)
-        thr_svm = st.number_input("OCSVM decision threshold (df < thr => anomaly)", value=float(defaults["thr_svm"]), step=0.05)
-        st.caption("Models are optional and do not override Confirmed/Suspected rules in this agricultural methodology.")
+    with st.expander("🧾 الاستهلاك (اختياري)", expanded=False):
+        use_consumption_if_available = st.toggle("استخدم عمود الاستهلاك إذا كان موجودًا", value=bool(defaults["use_consumption_if_available"]))
+        st.caption("إذا كان ملفك يحتوي consumption/Consumption/... فسيُستخدم لدعم حالات No-Consumption ضمن Suspected High.")
 
     st.markdown("---")
     st.download_button(
-        "⬇️ Download Excel Template",
+        "⬇️ تنزيل قالب Excel (Template)",
         make_template_excel(),
         file_name="agri_load_template.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# ---------------- Main ----------------
-tab_infer, tab_help = st.tabs(["📈 Analyze File", "ℹ️ Help"])
+# ---------------- Main tabs ----------------
+tab_infer, tab_help = st.tabs(["📈 تحليل ملف", "ℹ️ المساعدة"])
 
 with tab_infer:
-    st.subheader("Upload Excel for Analysis")
+    st.subheader("رفع ملف Excel للتحليل")
     uploaded = st.file_uploader(
-        "Required columns: Meter Number, V1,V2,V3,A1,A2,A3 (consumption optional)",
+        "الأعمدة المطلوبة: Meter Number, V1, V2, V3, A1, A2, A3 (اختياري: consumption)",
         type=["xlsx"]
     )
 
     if uploaded is None:
-        st.info("Upload an Excel file to start.")
+        st.info("ارفع ملف Excel للبدء.")
     else:
         try:
             df = pd.read_excel(uploaded)
             df.columns = [c.strip() for c in df.columns]
-
             validate_columns(df, [ID_COL] + FEATURE_COLS)
 
-            # Detect optional consumption column
             cons_col = find_consumption_col(df)
-            if cons_col is not None:
-                df["consumption_value"] = pd.to_numeric(df[cons_col], errors="coerce")
-            else:
-                df["consumption_value"] = np.nan
+            cols_to_num = FEATURE_COLS + ([cons_col] if cons_col is not None else [])
+            df = safe_to_numeric(df, cols_to_num)
 
-            df = safe_to_numeric(df, FEATURE_COLS + ["consumption_value"])
             df_infer = df.dropna(subset=FEATURE_COLS).copy().reset_index(drop=True)
-
             if df_infer.empty:
-                st.warning("No valid rows after cleaning (missing/non-numeric V/I).")
+                st.warning("لا يوجد صفوف صالحة بعد التنظيف (قيم ناقصة/غير رقمية).")
                 st.stop()
 
-            # Optional models inference
-            if use_models:
-                models = load_models_if_available()
-                if models is None:
-                    st.warning("Models not found (scaler.joblib / isolation_forest.joblib). Continuing rules-only.")
-                    use_models_runtime = False
-                else:
-                    use_models_runtime = True
-            else:
-                use_models_runtime = False
-
             detailed = df_infer[[ID_COL] + FEATURE_COLS].copy()
-            detailed["consumption_value"] = df_infer["consumption_value"].copy()
+            if cons_col is not None:
+                detailed[cons_col] = df_infer[cons_col].values
 
-            # If models enabled and available: compute flags (for reference only)
-            if use_models_runtime:
-                scaler = models["scaler"]
-                model_if = models["if"]
-                model_svm = models.get("svm", None)
+            # Optional model flag (reference only)
+            models = load_models()
+            scaler = models.get("scaler", None)
+            model_if = models.get("if", None)
+            model_svm = models.get("svm", None)
 
+            if scaler is not None and model_if is not None:
                 X = df_infer[FEATURE_COLS].values
                 Xs = scaler.transform(X)
-
-                df_if, df_svm, score_ens, flags, anom_if, anom_svm = model_decision_flags(
-                    Xs, model_if, model_svm=model_svm,
-                    thr_if=float(thr_if), thr_svm=float(thr_svm),
-                    use_or=bool(combine_or)
-                )
-
-                detailed["df_if"] = df_if
-                detailed["anom_if"] = anom_if
-                if df_svm is not None:
-                    detailed["df_svm"] = df_svm
-                    detailed["anom_svm"] = anom_svm
-                detailed["score_ensemble"] = score_ens
+                df_if, df_svm, score_ens, flags, anom_if, anom_svm = model_decision_flags(Xs, model_if, model_svm=model_svm)
                 detailed["model_flag"] = flags
+                detailed["df_if"] = df_if
+                detailed["score_ensemble"] = score_ens
             else:
                 detailed["model_flag"] = 0
 
-            # Electrical features
             detailed = compute_signal_features(detailed, i_near_zero_thr=float(i_near_zero_thr))
 
-            # Apply agricultural methodology
-            detailed = apply_agri_load_rules(
+            detailed = apply_load_based_rules(
                 detailed,
-                v_present_min=float(v_present_min),
                 v_zero_pct=float(v_zero_pct),
                 v_zero_abs_max=float(v_zero_abs_max),
-                i_significant=float(i_significant),
+                v_present_abs=float(v_present_abs),
+                v_other_present_abs=float(v_other_present_abs),
                 i_near_zero_thr=float(i_near_zero_thr),
+                i_phase_load_thr=float(i_phase_load_thr),
+                i_sum_no_load_thr=float(i_sum_no_load_thr),
+                i_sum_low_load_thr=float(i_sum_low_load_thr),
                 i_imb_confirm_thr=float(i_imb_confirm_thr),
-                no_load_sum_thr=float(no_load_sum_thr),
-                no_load_max_thr=float(no_load_max_thr),
-                low_load_sum_thr=float(low_load_sum_thr),
-                low_load_max_thr=float(low_load_max_thr),
+                use_consumption_if_available=bool(use_consumption_if_available),
             )
 
             # KPIs
@@ -513,7 +419,7 @@ with tab_infer:
             c_norm = int((detailed["final_label"] == "Normal").sum())
 
             k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Confirmed Loss", c_conf)
+            k1.metric("Confirmed", c_conf)
             k2.metric("Suspected High", c_high)
             k3.metric("Suspected Medium", c_med)
             k4.metric("Normal", c_norm)
@@ -527,11 +433,13 @@ with tab_infer:
                 suspected_high=("final_label", lambda s: int((s == "Suspected High Loss").sum())),
                 suspected_medium=("final_label", lambda s: int((s == "Suspected Medium Loss").sum())),
                 normal=("final_label", lambda s: int((s == "Normal").sum())),
+                max_Vmax=("V_max", "max"),
+                min_Vmin=("V_min", "min"),
                 max_Imax=("I_max", "max"),
                 max_Isum=("I_sum", "max"),
-                max_Vmean=("V_mean", "max"),
                 max_iimb=("i_imb", "max"),
-                max_severity=("severity_score", "max"),
+                max_vimb=("v_imb", "max"),
+                model_flags=("model_flag", "sum"),
             )
 
             def meter_label(row):
@@ -544,57 +452,53 @@ with tab_infer:
                 return "Normal"
 
             summary["meter_final_label"] = summary.apply(meter_label, axis=1)
-
-            pr = {
-                "Confirmed Loss": 0,
-                "Suspected High Loss": 1,
-                "Suspected Medium Loss": 2,
-                "Normal": 3
-            }
+            pr = {"Confirmed Loss": 0, "Suspected High Loss": 1, "Suspected Medium Loss": 2, "Normal": 3}
             summary["prio"] = summary["meter_final_label"].map(pr).fillna(9).astype(int)
 
             summary = summary.sort_values(
-                by=["prio", "max_severity", "confirmed", "suspected_high", "suspected_medium", "max_iimb", "max_Imax"],
-                ascending=[True, False, False, False, False, False, False]
+                by=["prio", "confirmed", "suspected_high", "suspected_medium", "max_iimb", "max_Imax"],
+                ascending=[True, False, False, False, False, False]
             ).drop(columns=["prio"]).reset_index(drop=True)
 
             # Tabs
             t_all, t_conf, t_high, t_med, t_norm = st.tabs(
-                ["📄 All", "✅ Confirmed", "🟧 Suspected High", "🟨 Suspected Medium", "🟩 Normal"]
+                ["📄 الكل", "✅ Confirmed", "🟥 Suspected High", "🟧 Suspected Medium", "🟩 Normal"]
             )
 
             with t_all:
-                render_table(summary, "Meter Summary (Prioritized)", "meter_summary_agri_load.xlsx", height=360)
-                render_table(detailed, "Detailed Results", "detailed_agri_load.xlsx", height=520)
+                render_table(summary, "ملخص العدادات (Meter Summary)", "summary_agri_load.xlsx", height=380)
+                render_table(detailed.drop(columns=["prio"], errors="ignore"), "النتائج التفصيلية (Detailed)", "detailed_agri_load.xlsx", height=450)
 
             with t_conf:
-                dfc = detailed[detailed["final_label"] == "Confirmed Loss"].copy()
-                render_table(dfc, "Confirmed Loss - Detailed", "confirmed_agri_load.xlsx", height=520)
+                render_table(detailed[detailed["final_label"] == "Confirmed Loss"].copy(),
+                             "Confirmed Loss - Detailed", "confirmed_agri_load.xlsx", height=520)
 
             with t_high:
-                dfh = detailed[detailed["final_label"] == "Suspected High Loss"].copy()
-                render_table(dfh, "Suspected High Loss - Detailed", "suspected_high_agri_load.xlsx", height=520)
+                render_table(detailed[detailed["final_label"] == "Suspected High Loss"].copy(),
+                             "Suspected High Loss - Detailed", "suspected_high_agri_load.xlsx", height=520)
 
             with t_med:
-                dfm = detailed[detailed["final_label"] == "Suspected Medium Loss"].copy()
-                render_table(dfm, "Suspected Medium Loss - Detailed", "suspected_medium_agri_load.xlsx", height=520)
+                render_table(detailed[detailed["final_label"] == "Suspected Medium Loss"].copy(),
+                             "Suspected Medium Loss - Detailed", "suspected_medium_agri_load.xlsx", height=520)
 
             with t_norm:
-                dfn = detailed[detailed["final_label"] == "Normal"].copy()
-                render_table(dfn, "Normal - Detailed", "normal_agri_load.xlsx", height=520)
+                render_table(detailed[detailed["final_label"] == "Normal"].copy(),
+                             "Normal - Detailed", "normal_agri_load.xlsx", height=520)
 
             # Reasons dashboard
             st.markdown("---")
-            st.subheader("Reasons Dashboard")
+            st.subheader("لوحة أسباب القرار (Reasons)")
             reason_cols = [
+                "reason_confirm_v0_any_phase",
                 "reason_confirm_v0_with_i",
                 "reason_confirm_i_near_zero",
                 "reason_confirm_extreme_iimb",
                 "reason_suspected_high_no_load",
+                "reason_suspected_high_no_consumption",
                 "reason_suspected_medium_low_load",
-                "support_consumption_zero",
             ]
-            reasons_sum = detailed[reason_cols].sum().sort_values(ascending=False).reset_index()
+            existing = [c for c in reason_cols if c in detailed.columns]
+            reasons_sum = detailed[existing].sum().sort_values(ascending=False).reset_index()
             reasons_sum.columns = ["Reason", "Count"]
             st.dataframe(reasons_sum, use_container_width=True)
 
@@ -603,23 +507,18 @@ with tab_infer:
 
 with tab_help:
     st.markdown("""
-## Agricultural Load-Based Loss Detection – Methodology
+### ✅ لماذا حالة (V=0 على فازة) تعتبر Confirmed حتى لو بدون تيار؟
+لأننا نفترض أن القائمة تخص **حقول زراعية فعّالة**.
+وجود فازة جهدها **قريب من الصفر** مع وجود جهد معتبر في فازة أخرى يدل غالبًا على:
+- فصل/قص VT أو خلل توصيل
+- عبث/تلاعب
+- خلل قياس أو توصيلات غير منطقية
 
-### Principle
-This system assumes the meter is associated with an active agricultural field.
-Therefore, **illogical electrical behavior** is treated as a potential non-technical loss indicator.
-
-### Classes
-- **Confirmed Loss**: clear electrical contradiction (e.g., I with V≈0).
-- **Suspected High Loss**: voltage present but no load (could be fed by another source).
-- **Suspected Medium Loss**: voltage present but very low load (seasonal/limited operation).
-- **Normal**: no abnormal behavior.
-
-### Output
-- Final class label
-- Primary reason
-- Supporting indicators (V_mean, I_sum, I_max, i_imb, …)
-- Prioritized list for field inspections
+### التصنيفات
+- **Confirmed Loss:** تناقض كهربائي واضح (ومنها V≈0 على أي فازة).
+- **Suspected High Loss:** جهد موجود + No-Load / No-Consumption (قد تكون تغذية بديلة).
+- **Suspected Medium Loss:** جهد موجود + Very Low Load (يحتاج تحقق زمني/سياقي).
+- **Normal:** لا توجد مؤشرات ضمن العتبات.
 """)
 
 st.markdown("---")
